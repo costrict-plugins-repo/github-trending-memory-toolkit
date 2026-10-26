@@ -1,0 +1,1044 @@
+/**
+ * E2E smoke tests — run all scripts against an isolated sandbox.
+ *
+ * Zero API calls, zero credentials. Creates a throwaway HOME with
+ * a toy git project and verifies scripts work end-to-end.
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { testEnv } = require('./helpers/env');
+const { execSync} = require('child_process');
+
+const PLUGIN_ROOT = path.join(__dirname, '..');
+
+// Sandbox: throwaway HOME + toy project
+let sandbox, fakeHome, projectDir, memoryDir;
+
+function memRun(args, opts = {}) {
+  return execSync(`node "${path.join(PLUGIN_ROOT, 'scripts', 'memory.js')}" --dir="${memoryDir}" ${args}`, {
+    encoding: 'utf8',
+    timeout: 5000,
+    cwd: projectDir,
+    ...opts,
+  }).trim();
+}
+
+function sessionLogRun(stdinJson) {
+  return execSync(
+    `echo '${JSON.stringify(stdinJson)}' | node "${path.join(PLUGIN_ROOT, 'scripts', 'session-log.js')}"`,
+    {
+      encoding: 'utf8',
+      timeout: 5000,
+      cwd: projectDir,
+      env: testEnv({ HOME: fakeHome }),
+    }
+  );
+}
+
+describe('e2e: isolated sandbox', () => {
+  before(() => {
+    // 1. Throwaway HOME
+    sandbox = fs.realpathSync(fs.mkdtempSync(path.join('/tmp', 'mt-e2e-')));
+    fakeHome = path.join(sandbox, 'home');
+    fs.mkdirSync(fakeHome, { recursive: true });
+
+    // 2. Toy project with git
+    projectDir = path.join(sandbox, 'project');
+    fs.mkdirSync(projectDir, { recursive: true });
+    execSync('git init && git commit --allow-empty -m "init"', {
+      cwd: projectDir,
+      encoding: 'utf8',
+    });
+
+    // 3. Memory dir (as CC would create it)
+    const { sanitizePath } = require('../scripts/lib/find-memory-dir');
+    memoryDir = path.join(fakeHome, '.claude', 'projects', sanitizePath(projectDir), 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+  });
+
+  after(() => {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  // --- memory.js ---
+
+  describe('memory.js in clean sandbox', () => {
+    it('list returns empty without crash', () => {
+      const out = memRun('list');
+      assert.ok(typeof out === 'string');
+    });
+
+    it('workstreams returns without crash', () => {
+      const out = memRun('workstreams');
+      assert.ok(typeof out === 'string');
+    });
+
+    it('note creates a note file', () => {
+      memRun('note "E2E test note"');
+      const today = new Date().toISOString().slice(0, 10);
+      const notePath = path.join(memoryDir, 'notes', `${today}.md`);
+      assert.ok(fs.existsSync(notePath), 'daily note should exist');
+      const content = fs.readFileSync(notePath, 'utf8');
+      assert.ok(content.includes('E2E test note'));
+    });
+
+    it('search finds the note', () => {
+      const out = memRun('search "E2E test"');
+      assert.ok(out.includes('E2E test note'));
+    });
+
+    it('add-workstream + workstreams round-trip', () => {
+      memRun('add-workstream test-ws e2e,smoke,sandbox');
+      const out = memRun('workstreams');
+      assert.ok(out.includes('test-ws'), 'new workstream should appear');
+    });
+
+    it('reindex does not crash on fresh dir', () => {
+      memRun('reindex');
+      const memoryMd = path.join(memoryDir, 'MEMORY.md');
+      // reindex may or may not create MEMORY.md depending on content
+      // but it must not crash
+    });
+  });
+
+  // --- session-log.js ---
+
+  describe('session-log.js in clean sandbox', () => {
+    it('creates daily note and sessions.jsonl', () => {
+      sessionLogRun({ session_id: 'e2e-001', transcript_path: '/tmp/e2e.jsonl' });
+
+      const today = new Date().toISOString().slice(0, 10);
+      const notePath = path.join(memoryDir, 'notes', `${today}.md`);
+      assert.ok(fs.existsSync(notePath), 'daily note should exist');
+      const noteContent = fs.readFileSync(notePath, 'utf8');
+      assert.ok(noteContent.includes('SESSION_START'));
+      assert.ok(noteContent.includes('e2e-001'));
+
+      const sessionsPath = path.join(memoryDir, 'sessions.jsonl');
+      assert.ok(fs.existsSync(sessionsPath), 'sessions.jsonl should exist');
+      const record = JSON.parse(fs.readFileSync(sessionsPath, 'utf8').trim().split('\n').pop());
+      assert.equal(record.id, 'e2e-001');
+    });
+
+    it('outputs valid JSON with systemMessage and additionalContext', () => {
+      const out = sessionLogRun({ session_id: 'e2e-002' });
+      const json = JSON.parse(out.trim());
+      assert.ok(json.systemMessage, 'should have systemMessage');
+      assert.ok(json.systemMessage.includes('memory-toolkit'), 'systemMessage should mention plugin');
+      assert.ok(json.hookSpecificOutput, 'should have hookSpecificOutput');
+      assert.equal(json.hookSpecificOutput.hookEventName, 'SessionStart');
+      assert.ok(json.hookSpecificOutput.additionalContext.includes('DOC:'), 'context should include DOC reminder');
+    });
+
+    it('updates stale MEMORY.md API block (AP-20)', () => {
+      // Write MEMORY.md with an old version path
+      const memoryMdPath = path.join(memoryDir, 'MEMORY.md');
+      fs.writeFileSync(memoryMdPath, [
+        '# Test Memory',
+        '## API',
+        '```bash',
+        'node /old/path/memory-toolkit/0.0.1/scripts/memory.js --dir=/some/dir <command>',
+        '```',
+      ].join('\n'));
+
+      sessionLogRun({ session_id: 'e2e-ap20' });
+
+      const updated = fs.readFileSync(memoryMdPath, 'utf8');
+      // Should contain current script path, not old one
+      assert.ok(
+        !updated.includes('0.0.1'),
+        'old version should be replaced'
+      );
+      assert.ok(
+        updated.includes(path.join(PLUGIN_ROOT, 'scripts', 'memory.js')),
+        'should contain current memory.js path'
+      );
+    });
+  });
+
+  // --- session-watcher.js plumbing ---
+
+  describe('session-watcher.js plumbing (no LLM)', () => {
+    it('finds transcript from sessions.jsonl and parses messages', () => {
+      // Ensure sessions.jsonl has an entry with transcript path
+      const sessionsPath = path.join(memoryDir, 'sessions.jsonl');
+      const transcriptPath = path.join(sandbox, 'transcript.jsonl');
+
+      // Write a fake transcript with enough messages
+      const messages = [];
+      for (let i = 0; i < 8; i++) {
+        messages.push(JSON.stringify({
+          type: i % 2 === 0 ? 'user' : 'assistant',
+          message: { content: [{ type: 'text', text: `Message ${i}` }] },
+        }));
+      }
+      fs.writeFileSync(transcriptPath, messages.join('\n') + '\n');
+
+      // Write sessions.jsonl entry pointing to transcript
+      fs.writeFileSync(sessionsPath,
+        JSON.stringify({ id: 'watcher-test', transcript: transcriptPath }) + '\n'
+      );
+
+      // Reset watcher state so it doesn't throttle
+      const statePath = path.join(memoryDir, '.watcher-state.json');
+      fs.writeFileSync(statePath, JSON.stringify({ offset: 0, lastRun: 0, transcriptPath: '' }));
+
+      // Run watcher — will fail at LLM call (no API key, no claude CLI in sandbox)
+      // but should NOT crash before reaching the LLM call
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js')}"`,
+          {
+            encoding: 'utf8',
+            timeout: 10000,
+            cwd: projectDir,
+            env: testEnv({ HOME: fakeHome }),
+          }
+        );
+      } catch {
+        // Expected: LLM call fails, but plumbing worked
+      }
+
+      // Verify: watcher state was updated (means it got past transcript parsing)
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      assert.ok(state.lastRun > 0, 'lastRun should be updated');
+      assert.equal(state.transcriptPath, transcriptPath, 'should track current transcript');
+      assert.equal(state.byteOffset, fs.statSync(transcriptPath).size, 'offset should advance past messages');
+    });
+
+    it('respects throttle — skips if ran recently', () => {
+      const statePath = path.join(memoryDir, '.watcher-state.json');
+      fs.writeFileSync(statePath, JSON.stringify({
+        offset: 0,
+        lastRun: Date.now(), // just now
+        transcriptPath: '',
+      }));
+
+      // Should exit silently (throttled)
+      const result = execSync(
+        `node "${path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js')}"`,
+        {
+          encoding: 'utf8',
+          timeout: 5000,
+          cwd: projectDir,
+          env: testEnv({ HOME: fakeHome }),
+        }
+      );
+      // Throttled — should output empty JSON
+      const json = JSON.parse(result.trim());
+      assert.deepEqual(json, {});
+    });
+
+    it('prompt includes documentation type', () => {
+      const watcherSource = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js'), 'utf8'
+      );
+      assert.ok(
+        watcherSource.includes('documentation'),
+        'ANALYSIS_PROMPT should include documentation type'
+      );
+    });
+
+    it('documentation findings use DOC: prefix', () => {
+      const watcherSource = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js'), 'utf8'
+      );
+      assert.ok(
+        watcherSource.includes("'DOC'") || watcherSource.includes('"DOC"'),
+        'saveFindings should use DOC: prefix for documentation type'
+      );
+    });
+  });
+
+  // --- session-watcher.js new features ---
+
+  describe('session-watcher.js state management', () => {
+    it('persists findingsCount, docCount, phase in state', () => {
+      const wStatePath = path.join(memoryDir, '.watcher-state.json');
+      const transcriptPath = path.join(sandbox, 'transcript-state.jsonl');
+
+      // Write enough messages
+      const messages = [];
+      for (let i = 0; i < 8; i++) {
+        messages.push(JSON.stringify({
+          type: i % 2 === 0 ? 'user' : 'assistant',
+          message: { content: [{ type: 'text', text: `State test message ${i}` }] },
+        }));
+      }
+      fs.writeFileSync(transcriptPath, messages.join('\n') + '\n');
+
+      // Write sessions.jsonl
+      const sessionsPath = path.join(memoryDir, 'sessions.jsonl');
+      fs.writeFileSync(sessionsPath,
+        JSON.stringify({ id: 'state-test', transcript: transcriptPath }) + '\n'
+      );
+
+      // Set initial state with counters
+      fs.writeFileSync(wStatePath, JSON.stringify({
+        offset: 0, lastRun: 0, transcriptPath: '',
+        findingsCount: 5, docCount: 1, phase: 'planning',
+        suggestedReflect: false, suggestedDocs: false,
+      }));
+
+      // Run watcher (LLM will fail, but state should be persisted)
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js')}"`,
+          {
+            encoding: 'utf8',
+            timeout: 10000,
+            cwd: projectDir,
+            env: testEnv({ HOME: fakeHome }),
+          }
+        );
+      } catch {}
+
+      const state = JSON.parse(fs.readFileSync(wStatePath, 'utf8'));
+      // State should preserve counters (same transcript = not a new session)
+      // findingsCount may stay 5 (LLM failed, no new findings) — just check it exists
+      assert.ok('findingsCount' in state, 'state should have findingsCount');
+      assert.ok('docCount' in state, 'state should have docCount');
+      assert.ok('phase' in state, 'state should have phase');
+      assert.ok('suggestedReflect' in state, 'state should have suggestedReflect');
+      assert.ok('suggestedDocs' in state, 'state should have suggestedDocs');
+    });
+
+    it('resets counters on new session (transcript change)', () => {
+      const wStatePath = path.join(memoryDir, '.watcher-state.json');
+      const newTranscript = path.join(sandbox, 'transcript-new.jsonl');
+
+      // Write messages for new transcript
+      const messages = [];
+      for (let i = 0; i < 8; i++) {
+        messages.push(JSON.stringify({
+          type: i % 2 === 0 ? 'user' : 'assistant',
+          message: { content: [{ type: 'text', text: `New session message ${i}` }] },
+        }));
+      }
+      fs.writeFileSync(newTranscript, messages.join('\n') + '\n');
+
+      // sessions.jsonl points to new transcript
+      const sessionsPath = path.join(memoryDir, 'sessions.jsonl');
+      fs.writeFileSync(sessionsPath,
+        JSON.stringify({ id: 'new-session', transcript: newTranscript }) + '\n'
+      );
+
+      // Old state has accumulated counters from a DIFFERENT transcript
+      fs.writeFileSync(wStatePath, JSON.stringify({
+        offset: 50, lastRun: 0,
+        transcriptPath: '/old/transcript.jsonl', // different path → new session
+        findingsCount: 10, docCount: 5, phase: 'review',
+        suggestedReflect: true, suggestedDocs: true,
+      }));
+
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js')}"`,
+          {
+            encoding: 'utf8',
+            timeout: 10000,
+            cwd: projectDir,
+            env: testEnv({ HOME: fakeHome }),
+          }
+        );
+      } catch {}
+
+      const state = JSON.parse(fs.readFileSync(wStatePath, 'utf8'));
+      // New session → counters should be reset
+      assert.equal(state.findingsCount, 0, 'findingsCount should reset on new session');
+      assert.equal(state.docCount, 0, 'docCount should reset on new session');
+      assert.equal(state.suggestedReflect, false, 'suggestedReflect should reset');
+      assert.equal(state.suggestedDocs, false, 'suggestedDocs should reset');
+      assert.equal(state.phase, null, 'phase should reset on new session');
+      assert.equal(state.byteOffset, fs.statSync(newTranscript).size, 'offset should start from 0 for new transcript');
+    });
+
+    it('reads transcript_path from stdin when provided', () => {
+      const wStatePath = path.join(memoryDir, '.watcher-state.json');
+      const stdinTranscript = path.join(sandbox, 'transcript-stdin.jsonl');
+
+      // Write messages
+      const messages = [];
+      for (let i = 0; i < 8; i++) {
+        messages.push(JSON.stringify({
+          type: i % 2 === 0 ? 'user' : 'assistant',
+          message: { content: [{ type: 'text', text: `Stdin test ${i}` }] },
+        }));
+      }
+      fs.writeFileSync(stdinTranscript, messages.join('\n') + '\n');
+
+      // Reset state
+      fs.writeFileSync(wStatePath, JSON.stringify({ offset: 0, lastRun: 0, transcriptPath: '' }));
+
+      // Pass transcript_path via stdin (simulating PostToolUse hook payload)
+      const stdinPayload = JSON.stringify({
+        hook_event_name: 'PostToolUse',
+        session_id: 'stdin-test',
+        transcript_path: stdinTranscript,
+        tool_name: 'Bash',
+      });
+
+      try {
+        execSync(
+          `echo '${stdinPayload}' | node "${path.join(PLUGIN_ROOT, 'scripts', 'session-watcher.js')}"`,
+          {
+            encoding: 'utf8',
+            timeout: 10000,
+            cwd: projectDir,
+            env: testEnv({ HOME: fakeHome }),
+          }
+        );
+      } catch {}
+
+      const state = JSON.parse(fs.readFileSync(wStatePath, 'utf8'));
+      assert.equal(state.transcriptPath, stdinTranscript, 'should use transcript_path from stdin');
+      assert.equal(state.byteOffset, fs.statSync(stdinTranscript).size, 'should have read messages from stdin transcript');
+    });
+  });
+
+  // --- hooks.json structure ---
+
+  describe('hooks.json configuration', () => {
+    it('has SubagentStop event', () => {
+      const hooksJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'), 'utf8')
+      );
+      assert.ok(hooksJson.hooks.SubagentStop, 'SubagentStop should be configured');
+      assert.ok(
+        hooksJson.hooks.SubagentStop[0].hooks[0].command.includes('session-watcher'),
+        'SubagentStop should run session-watcher'
+      );
+    });
+
+    it('has all expected hook events', () => {
+      const hooksJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'), 'utf8')
+      );
+      const events = Object.keys(hooksJson.hooks);
+      assert.ok(events.includes('PreCompact'), 'should have PreCompact');
+      assert.ok(events.includes('PostToolUse'), 'should have PostToolUse');
+      assert.ok(events.includes('SessionStart'), 'should have SessionStart');
+      assert.ok(events.includes('SubagentStop'), 'should have SubagentStop');
+      assert.ok(events.includes('UserPromptSubmit'), 'should have UserPromptSubmit');
+    });
+
+    it('UserPromptSubmit hook runs pipeline-hint', () => {
+      const hooksJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'), 'utf8')
+      );
+      const ups = hooksJson.hooks.UserPromptSubmit || [];
+      assert.ok(ups.length > 0, 'UserPromptSubmit must be configured');
+      assert.ok(
+        ups[0].hooks[0].command.includes('pipeline-hint'),
+        'UserPromptSubmit should run pipeline-hint.js'
+      );
+    });
+
+    it('all hook commands use CLAUDE_PLUGIN_ROOT', () => {
+      const hooksJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'), 'utf8')
+      );
+      for (const [event, matchers] of Object.entries(hooksJson.hooks)) {
+        for (const matcher of matchers) {
+          for (const hook of matcher.hooks) {
+            assert.ok(
+              hook.command.includes('${CLAUDE_PLUGIN_ROOT}'),
+              `${event} hook should use CLAUDE_PLUGIN_ROOT: ${hook.command}`
+            );
+          }
+        }
+      }
+    });
+  });
+
+  // --- find-memory-dir edge cases ---
+
+  describe('find-memory-dir edge cases', () => {
+    it('returns exists:false for completely unknown path', () => {
+      const { findMemoryDir } = require('../scripts/lib/find-memory-dir');
+      const result = findMemoryDir('/nonexistent/path/to/xyzzy-unique-no-match-12345');
+      assert.equal(result.exists, false, 'no memory dir should exist for unknown path');
+      assert.ok(result.dir, 'should return a formula-based dir');
+    });
+
+    it('sanitize handles dots in path', () => {
+      const { memoryDirFor } = require('../scripts/lib/find-memory-dir');
+      const dir = memoryDirFor('/Users/user.name/project');
+      // The project key part (after /projects/) should have dots replaced with dashes
+      const projectKey = dir.split('/projects/')[1].split('/')[0];
+      assert.ok(projectKey.includes('-Users-user-name-project'), `should sanitize dots: ${projectKey}`);
+      assert.ok(!projectKey.includes('.'), `project key should not contain dots: ${projectKey}`);
+    });
+
+    // Resolution rules (git root, worktrees, overrides) are in find-memory-dir.test.js.
+  });
+
+  // --- Path sanitization ---
+
+  describe('PROJ_KEY sanitization matches CC', () => {
+    it("SKILL.md sed command matches find-memory-dir sanitizePath()", () => {
+      const { sanitizePath } = require('../scripts/lib/find-memory-dir');
+      const testPaths = [
+        '/Users/i.gorskiy/Desktop/projects/my-app',
+        '/home/user.name/code/my_project',
+        '/Users/me/Documents/Obsidian Vault',
+      ];
+      for (const testPath of testPaths) {
+        // What the skills run: pwd | sed 's/[^a-zA-Z0-9]/-/g'
+        const bashKey = execSync(`printf '%s' "${testPath}" | sed 's/[^a-zA-Z0-9]/-/g'`, { encoding: 'utf8' });
+        assert.equal(sanitizePath(testPath), bashKey, `sanitization mismatch for ${testPath}`);
+      }
+    });
+
+    it('no skill computes the key with the legacy tr formula', () => {
+      for (const skill of fs.readdirSync(path.join(PLUGIN_ROOT, 'skills'))) {
+        const file = path.join(PLUGIN_ROOT, 'skills', skill, 'SKILL.md');
+        if (!fs.existsSync(file)) continue;
+        assert.ok(!fs.readFileSync(file, 'utf8').includes("tr '/.'"), `${skill} uses tr '/.'`);
+      }
+    });
+  });
+
+  // --- Configurable targets (no hardcoded destinations) ---
+
+  describe('skills ask before writing to project files', () => {
+    it('reflect does not hardcode backlog.md as only option', () => {
+      const content = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'skills', 'reflect', 'SKILL.md'), 'utf8'
+      );
+      // Should mention detection/asking, not just "Read: backlog.md"
+      assert.ok(
+        content.includes('backlog_target') || content.includes('Where do you track'),
+        'reflect should detect or ask for backlog location'
+      );
+    });
+
+    it('docs-reflect does not hardcode .claude/rules/ as only option', () => {
+      const content = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'skills', 'docs-reflect', 'SKILL.md'), 'utf8'
+      );
+      assert.ok(
+        content.includes('docs_target') || content.includes('Where should'),
+        'docs-reflect should detect or ask for rules location'
+      );
+    });
+  });
+
+  // --- Path integrity ---
+
+  describe('no hardcoded paths in skills', () => {
+    const skillsDir = path.join(PLUGIN_ROOT, 'skills');
+
+    it('SKILL.md files do not contain hardcoded home paths', () => {
+      const skills = fs.readdirSync(skillsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => path.join(skillsDir, d.name, 'SKILL.md'))
+        .filter(f => fs.existsSync(f));
+
+      assert.ok(skills.length > 0, 'should find at least one SKILL.md');
+
+      for (const skillPath of skills) {
+        const content = fs.readFileSync(skillPath, 'utf8');
+        // Should not contain /Users/ or /home/ hardcoded paths
+        const hardcoded = content.match(/(?:\/Users\/\w+|\/home\/\w+)(?!.*\{)/g);
+        assert.equal(
+          hardcoded,
+          null,
+          `${path.basename(path.dirname(skillPath))}/SKILL.md has hardcoded path: ${hardcoded}`
+        );
+      }
+    });
+
+    it('SKILL.md files use CLAUDE_PLUGIN_ROOT for script paths', () => {
+      const sessionStart = fs.readFileSync(
+        path.join(skillsDir, 'session-start', 'SKILL.md'), 'utf8'
+      );
+      // If it references memory.js, it should use CLAUDE_PLUGIN_ROOT or relative path
+      if (sessionStart.includes('memory.js')) {
+        const lines = sessionStart.split('\n').filter(l =>
+          l.includes('memory.js') && !l.startsWith('#') && !l.startsWith('//')
+        );
+        for (const line of lines) {
+          // Should either use CLAUDE_PLUGIN_ROOT or --dir, not a fixed absolute path to plugins cache
+          const hasPluginRoot = line.includes('CLAUDE_PLUGIN_ROOT');
+          const isMEMvar = line.includes('$MEM');
+          const isComment = line.trim().startsWith('#') || line.trim().startsWith('//');
+          assert.ok(
+            hasPluginRoot || isMEMvar || isComment,
+            `session-start SKILL.md references memory.js without CLAUDE_PLUGIN_ROOT or $MEM: ${line.trim()}`
+          );
+        }
+      }
+    });
+  });
+
+  // --- UX: mandatory confirmations and menus ---
+
+  describe('skills have mandatory UX gates', () => {
+    const skillsDir = path.join(PLUGIN_ROOT, 'skills');
+
+    function readSkill(name) {
+      return fs.readFileSync(path.join(skillsDir, name, 'SKILL.md'), 'utf8');
+    }
+
+    it('session-start has mandatory Create new workstream', () => {
+      const content = readSkill('session-start');
+      assert.ok(
+        content.includes('MANDATORY') || content.includes('Never omit'),
+        'session-start must enforce + Create new workstream'
+      );
+    });
+
+    it('session-start has task-card phase as pipeline gate', () => {
+      const yaml = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'skills', 'task-template', 'templates', 'session-start.yaml'), 'utf8'
+      );
+      assert.ok(
+        yaml.includes('id: task-card'),
+        'session-start.yaml should declare a task-card phase'
+      );
+      assert.ok(
+        yaml.includes('What') && yaml.includes('Workstream'),
+        'task card phase should reference What and Workstream fields'
+      );
+      assert.ok(
+        yaml.includes('do NOT ask user to fill fields'),
+        'task card must auto-fill, not ask user to fill a form'
+      );
+      assert.ok(
+        yaml.includes('Start? Or adjust?'),
+        'task card must confirm before starting work'
+      );
+    });
+
+    it('session-start pipeline YAML has verify gates', () => {
+      const yaml = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'skills', 'task-template', 'templates', 'session-start.yaml'), 'utf8'
+      );
+      assert.ok(yaml.includes('verify:'), 'pipeline should have verify gates');
+      assert.ok(
+        yaml.includes('depends: [task-card]'),
+        'work phase must depend on task-card phase'
+      );
+    });
+
+    it('session-start uses letters for focus candidates (not numbers)', () => {
+      const content = readSkill('session-start');
+      // Check SKILL.md or pipeline YAML
+      const yaml = fs.readFileSync(
+        path.join(PLUGIN_ROOT, 'skills', 'task-template', 'templates', 'session-start.yaml'), 'utf8'
+      );
+      const hasLetters = content.includes('a. b. c.') || yaml.includes('a. b. c.');
+      assert.ok(hasLetters, 'focus candidates should use letters (a/b/c) to avoid clash with workstream numbers');
+    });
+
+    it('park requires confirmation before writing', () => {
+      const content = readSkill('park');
+      assert.ok(
+        content.includes('MUST') && content.includes('confirm'),
+        'park must require confirmation before writing'
+      );
+      assert.ok(
+        content.includes('Do NOT write until'),
+        'park must explicitly block writes before confirm'
+      );
+    });
+
+    it('session-continue requires explicit confirmation', () => {
+      const content = readSkill('session-continue');
+      assert.ok(
+        content.includes('MUST wait') && content.includes('confirmation'),
+        'session-continue must wait for explicit confirmation'
+      );
+    });
+
+    it('session-insights has numbered menu for save options', () => {
+      const content = readSkill('session-insights');
+      assert.ok(
+        content.includes('MUST present all options') && content.includes('numbered menu'),
+        'session-insights must use numbered menu'
+      );
+      assert.ok(
+        content.includes('before writing anything'),
+        'session-insights must wait before writing'
+      );
+    });
+
+    it('session-end Phase 1 requires confirmation before handoff write', () => {
+      const content = readSkill('session-end');
+      assert.ok(
+        content.includes('MUST show') && content.includes('wait for confirmation'),
+        'session-end Phase 1 must confirm before writing handoff'
+      );
+    });
+
+    it('session-end Phase 1 has routing analysis preview (AP-24)', () => {
+      const content = readSkill('session-end');
+      assert.ok(
+        content.includes('Routing analysis') && content.includes('session-activity') && content.includes('classify'),
+        'session-end Phase 1 must run routing analysis on session activity'
+      );
+    });
+
+    it('session-end Phase 1d writes per-workstream handoffs (AP-24)', () => {
+      const content = readSkill('session-end');
+      assert.ok(
+        content.includes('write-handoff') && content.includes('--workstream=') && content.includes('Per-workstream handoffs'),
+        'session-end Phase 1d must call write-handoff per workstream + write global cross-refs'
+      );
+    });
+
+    it('memory-setup fresh path requires confirmation', () => {
+      const content = readSkill('memory-setup');
+      assert.ok(
+        content.includes('Wait for confirmation') && content.includes('Proceed?'),
+        'memory-setup fresh setup must confirm before creating files'
+      );
+    });
+
+    it('all writing skills have at least one confirmation gate', () => {
+      // Skills that write files must have confirmation language
+      const writingSkills = ['park', 'reflect', 'docs-reflect', 'session-end', 'memory-setup'];
+      for (const name of writingSkills) {
+        const content = readSkill(name);
+        const hasGate = content.includes('MUST') || content.includes('confirmation') ||
+                        content.includes('confirm') || content.includes('Do NOT write');
+        assert.ok(hasGate, `${name} should have a confirmation gate before writing`);
+      }
+    });
+  });
+
+  // --- Pipeline hint hook (PreToolUse on Skill) ---
+
+  describe('pipeline-hint.js UserPromptSubmit hook', () => {
+    function hintRun(stdinJson) {
+      try {
+        return execSync(
+          `echo '${JSON.stringify(stdinJson)}' | node "${path.join(PLUGIN_ROOT, 'scripts', 'pipeline-hint.js')}"`,
+          {
+            encoding: 'utf8',
+            timeout: 5000,
+            env: testEnv({ CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT, MEMORY_TOOLKIT_PIPELINE_DEBUG: '1' }),
+          }
+        );
+      } catch (e) {
+        return e.stdout || '';
+      }
+    }
+
+    it('injects contract for /session-end', () => {
+      const out = hintRun({ prompt: '/session-end quick' });
+      assert.ok(out.trim(), 'should produce output for pipeline skill');
+      const json = JSON.parse(out.trim());
+      assert.equal(json.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+      assert.ok(json.hookSpecificOutput.additionalContext.includes('PIPELINE SKILL DETECTED: session-end'));
+      assert.ok(json.hookSpecificOutput.additionalContext.includes('PIPELINE START'));
+      assert.ok(json.hookSpecificOutput.additionalContext.includes('session-end.yaml'));
+    });
+
+    it('handles qualified slash (/memory-toolkit:session-start)', () => {
+      const out = hintRun({ prompt: '/memory-toolkit:session-start' });
+      assert.ok(out.trim(), 'should produce output');
+      const json = JSON.parse(out.trim());
+      assert.ok(json.hookSpecificOutput.additionalContext.includes('session-start'));
+    });
+
+    it('stays silent for non-pipeline skill (/memory)', () => {
+      const out = hintRun({ prompt: '/memory list' });
+      assert.equal(out.trim(), '', 'no output for non-pipeline skill');
+    });
+
+    it('stays silent for plain text (no slash)', () => {
+      const out = hintRun({ prompt: 'hello world' });
+      assert.equal(out.trim(), '', 'no output for plain prompt');
+    });
+
+    it('stays silent for unknown skill (/does-not-exist)', () => {
+      const out = hintRun({ prompt: '/does-not-exist' });
+      assert.equal(out.trim(), '', 'no output for unknown skill');
+    });
+
+    it('stays silent for malformed stdin', () => {
+      const out = execSync(
+        `echo 'not json' | node "${path.join(PLUGIN_ROOT, 'scripts', 'pipeline-hint.js')}"`,
+        { encoding: 'utf8', timeout: 5000, env: testEnv({ CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT }) }
+      );
+      assert.equal(out.trim(), '', 'no output for malformed stdin');
+    });
+  });
+
+  // --- Pipeline validation ---
+
+  describe('task-template pipeline validation', () => {
+    it('validate-pipeline passes for all templates', () => {
+      const result = execSync(
+        `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" --all`,
+        { encoding: 'utf8', timeout: 5000 }
+      );
+      assert.ok(result.includes('valid'), 'all pipelines should be valid');
+      assert.ok(!result.includes('error'), 'no errors expected');
+    });
+
+    it('pipeline schema file exists and is valid JSON', () => {
+      const schemaPath = path.join(PLUGIN_ROOT, 'skills', 'task-template', 'pipeline.schema.json');
+      assert.ok(fs.existsSync(schemaPath), 'pipeline.schema.json should exist');
+      const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+      assert.equal(schema.title, 'Task Template Pipeline');
+      assert.ok(schema.$defs.phase, 'schema should define phase');
+      assert.ok(schema.$defs.step, 'schema should define step');
+    });
+
+    it('validate-pipeline detects missing id', () => {
+      const badYaml = path.join(sandbox, 'bad-no-id.yaml');
+      fs.writeFileSync(badYaml, [
+        'name: bad',
+        'phases:',
+        '  - description: no id here',
+        '    steps:',
+        '      - description: step',
+      ].join('\n'));
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${badYaml}"`,
+          { encoding: 'utf8', timeout: 5000 }
+        );
+        assert.fail('should have exited with error');
+      } catch (e) {
+        assert.ok(e.stderr.includes('missing') || e.stdout.includes('missing'), 'should report missing id');
+      }
+    });
+
+    it('validate-pipeline detects broken depends', () => {
+      const badYaml = path.join(sandbox, 'bad-depends.yaml');
+      fs.writeFileSync(badYaml, [
+        'name: bad',
+        'phases:',
+        '  - id: start',
+        '    description: first',
+        '    steps:',
+        '      - description: step',
+        '    verify: check',
+        '  - id: end',
+        '    description: last',
+        '    depends: [nonexistent]',
+        '    steps:',
+        '      - description: step',
+      ].join('\n'));
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${badYaml}"`,
+          { encoding: 'utf8', timeout: 5000 }
+        );
+        assert.fail('should have exited with error');
+      } catch (e) {
+        assert.ok(e.stderr.includes('does not exist'), 'should report broken depends');
+      }
+    });
+
+    it('validate-pipeline detects missing verify gates', () => {
+      const badYaml = path.join(sandbox, 'bad-no-verify.yaml');
+      fs.writeFileSync(badYaml, [
+        'name: bad',
+        'phases:',
+        '  - id: start',
+        '    description: first',
+        '    steps:',
+        '      - description: step',
+        '  - id: end',
+        '    description: last',
+        '    depends: [start]',
+        '    steps:',
+        '      - description: step',
+      ].join('\n'));
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${badYaml}"`,
+          { encoding: 'utf8', timeout: 5000 }
+        );
+        assert.fail('should have exited with error');
+      } catch (e) {
+        assert.ok(e.stderr.includes('verify'), 'should report missing verify gates');
+      }
+    });
+
+    it('validate-pipeline detects retry_from pointing to missing phase', () => {
+      const badYaml = path.join(sandbox, 'bad-retry-from.yaml');
+      fs.writeFileSync(badYaml, [
+        'name: bad',
+        'phases:',
+        '  - id: only',
+        '    description: only phase',
+        '    steps:',
+        '      - description: step',
+        '    verify: gate',
+        '    retry_from: nonexistent',
+      ].join('\n'));
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${badYaml}"`,
+          { encoding: 'utf8', timeout: 5000 }
+        );
+        assert.fail('should have exited with error');
+      } catch (e) {
+        assert.ok(
+          (e.stderr || '').includes('retry_from'),
+          'should report bad retry_from'
+        );
+      }
+    });
+
+    it('validate-pipeline rejects retry_from without verify', () => {
+      const badYaml = path.join(sandbox, 'retry-without-verify.yaml');
+      fs.writeFileSync(badYaml, [
+        'name: bad',
+        'phases:',
+        '  - id: a',
+        '    description: a',
+        '    steps:',
+        '      - description: step',
+        '    verify: ok',
+        '  - id: b',
+        '    description: b',
+        '    depends: [a]',
+        '    steps:',
+        '      - description: step',
+        '    retry_from: a',
+      ].join('\n'));
+      try {
+        execSync(
+          `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${badYaml}"`,
+          { encoding: 'utf8', timeout: 5000 }
+        );
+        assert.fail('should have exited with error');
+      } catch (e) {
+        assert.ok(
+          (e.stderr || '').includes('retry_from requires'),
+          'should report retry_from without verify'
+        );
+      }
+    });
+
+    it('validate-pipeline accepts directory argument', () => {
+      const templatesDir = path.join(PLUGIN_ROOT, 'skills', 'task-template', 'templates');
+      const result = execSync(
+        `node "${path.join(PLUGIN_ROOT, 'scripts', 'validate-pipeline.js')}" "${templatesDir}"`,
+        { encoding: 'utf8', timeout: 5000 }
+      );
+      assert.ok(result.includes('valid'), 'directory arg should expand to all yamls');
+    });
+  });
+
+  // --- Version consistency ---
+
+  describe('version consistency', () => {
+    it('plugin.json has a valid semver', () => {
+      const pluginJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'), 'utf8')
+      );
+      assert.ok(
+        /^\d+\.\d+\.\d+$/.test(pluginJson.version),
+        `version should be semver: ${pluginJson.version}`
+      );
+    });
+  });
+
+  // --- Structured logger ---
+
+  describe('lib/log.js', () => {
+    it('outputs JSON with version to stderr at info level', () => {
+      const r = execSync(
+        `node -e "require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}').info('e2e-log-test')" 2>&1`,
+        { encoding: 'utf8', timeout: 3000 }
+      ).trim();
+      const entry = JSON.parse(r);
+      assert.ok(entry.ts, 'should have timestamp');
+      assert.ok(entry.v, 'should have version');
+      assert.equal(entry.level, 'info');
+      assert.equal(entry.msg, 'e2e-log-test');
+    });
+
+    it('respects MT_LOG=silent', () => {
+      const r = execSync(
+        `MT_LOG=silent node -e "require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}').error('should-not-appear')" 2>&1`,
+        { encoding: 'utf8', timeout: 3000 }
+      ).trim();
+      assert.equal(r, '', 'silent should suppress all output');
+    });
+
+    it('shows debug when MT_LOG=debug', () => {
+      const r = execSync(
+        `MT_LOG=debug node -e "require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}').debug('dbg-test')" 2>&1`,
+        { encoding: 'utf8', timeout: 3000 }
+      ).trim();
+      const entry = JSON.parse(r);
+      assert.equal(entry.level, 'debug');
+      assert.equal(entry.msg, 'dbg-test');
+    });
+
+    it('appends to MT_LOG_FILE while still writing to stderr', () => {
+      const logFile = path.join(os.tmpdir(), `mt-log-sink-${Date.now()}.log`);
+      try {
+        const stderr = execSync(
+          `MT_LOG_FILE=${logFile} node -e "var l=require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}');l.info('first');l.info('second')" 2>&1 1>/dev/null`,
+          { encoding: 'utf8', timeout: 3000 }
+        );
+        const stderrLines = stderr.trim().split('\n').filter(Boolean);
+        assert.equal(stderrLines.length, 2, 'stderr should receive both lines');
+        const fileLines = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
+        assert.equal(fileLines.length, 2, 'file should receive both lines');
+        assert.equal(JSON.parse(fileLines[0]).msg, 'first');
+        assert.equal(JSON.parse(fileLines[1]).msg, 'second');
+      } finally {
+        try { fs.unlinkSync(logFile); } catch {}
+      }
+    });
+
+    it('creates parent directory for MT_LOG_FILE if missing', () => {
+      const dir = path.join(os.tmpdir(), `mt-log-dir-${Date.now()}`, 'nested');
+      const logFile = path.join(dir, 'hook.log');
+      try {
+        execSync(
+          `MT_LOG_FILE=${logFile} node -e "require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}').warn('mk')" 2>/dev/null`,
+          { encoding: 'utf8', timeout: 3000 }
+        );
+        assert.ok(fs.existsSync(logFile), 'log file should be created');
+        const entry = JSON.parse(fs.readFileSync(logFile, 'utf8').trim());
+        assert.equal(entry.msg, 'mk');
+      } finally {
+        try { fs.rmSync(path.dirname(path.dirname(logFile)), { recursive: true, force: true }); } catch {}
+      }
+    });
+
+    it('does not throw when MT_LOG_FILE path is unwritable', () => {
+      // /dev/full on Linux would fail writes; on macOS use a path under a regular file
+      const blocker = path.join(os.tmpdir(), `mt-log-blocker-${Date.now()}`);
+      fs.writeFileSync(blocker, 'x');
+      const badPath = path.join(blocker, 'child.log'); // blocker is a file, can't be a dir
+      try {
+        const r = execSync(
+          `MT_LOG_FILE=${badPath} node -e "require('${path.join(PLUGIN_ROOT, 'scripts', 'lib', 'log')}').info('survive');console.log('ok')" 2>/dev/null`,
+          { encoding: 'utf8', timeout: 3000 }
+        ).trim();
+        assert.equal(r, 'ok', 'caller should not crash when file sink fails');
+      } finally {
+        try { fs.unlinkSync(blocker); } catch {}
+      }
+    });
+  });
+
+  // --- plugin.json ---
+
+  describe('plugin.json has no keys Claude Code ignores', () => {
+    it('no commandsMetadata (internal CC field, never read from the manifest)', () => {
+      const pluginJson = JSON.parse(
+        fs.readFileSync(path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'), 'utf8')
+      );
+      assert.ok(!('commandsMetadata' in pluginJson),
+        'skill permissions belong in SKILL.md frontmatter (allowed-tools)');
+    });
+  });
+});
